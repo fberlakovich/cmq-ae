@@ -1,0 +1,148 @@
+#+title: Insights
+
+* cgen default instructions
+`DefaultInstr`s store a `function_id`.
+If no specific template is registered and `add_default` is activated for the instruction set, cgen generates code with the `DefaultInstrt` template is used.
+The `DefaultInstr` template is chosen based on the instruction class name.
+If no specific template for the opname can be found, cgen uses the class name instead to lookup the template.
+Since the class is also called `DefaultInstr`, cgen will use the `DefaultInstr` template for all `DefaultInstr` objects without an explicit template.
+The `function_id` is stored in `DEFAULT_INSTR_IMPL_FUNCTIONS` and stores for each opcode name the C function name that implements the corresponding opcode.
+For example, `BINARY_ADD` is implemented by `PyNumber_Add`.
+This mapping is no longer useful in Python 3.11 because e.g. all binary operation opcodes have been collapsed into `BINARY_OP`.
+The actual instruction implementations are added in `add_operation_implementation`.
+
+* cgen derivative instructions
+The derivatives are created in the `derive` function (called via the multiplexer) of the corresponding class, e.g. `InlineCaching`.
+
+* cgen inline caching derivatives from gdb dump
+The inline caching class uses a C structure dump from gdb (stored in `typedefs.TYPE_DATA`) to automatically create inline caching derivatives for each type and operation function.
+For example, it generates a derivative for Long together with the concrete instantiation of `tp_richcompare`.
+
+* the interaction between the optimized and unoptimized interpreter routine became trickier with Python 3.11
+** Python 3.11 uses gotos at certain points (e.g. in RETURN_VALUE) to keep the C stack frame, but execute with a different Python stack frame
+** If this happens in the optimized interpreter and the previous frame is an unoptimized frame (i.e. the Python frame to be executed next) we need to deopt properly into the unoptimized interpreter routine.
+Otherwise the optimized interpreter routine works on a not properly initialized/optimized Python stack frame
+
+* coroutines vs await/async vs generators
+** generators allow pausing/resuming a function with `yield``
+*** calling code can `send` info back to the yield call into the function
+** coroutines are special generators (marked with e.g. `asyncio`)
+*** asyncio uses the same mechanisms (`yield` and `send`) to handle coroutines, but accepts only coroutines, not generic generators
+** async/await uses the same principles, but accepts only `Awaitable`s. Coroutines are `Awaitable`s by default
+*** calling await (the `GET_AWAITABLE` bytecode) calls the `__await__` function of the object to retrieve an iterable (generator)
+*** from that point on, `await` essentially does the same as `yield from`, i.e. it reads from the generator (awaitable object) and passes the result down to the calling function as if it was a `yield` call
+** conceptually
+*** generators produce values
+*** coroutines consume and sometimes also produce values
+*** coroutines are built on generators internally, by concepts are different
+
+* 16 bits of cache storage in the 64 bit instruction format is too little
+** e.g. precludes optimizations that need to remember the type version (and deopt if the type was changed)
+** information could only be stored out of band, i.e., not inline
+** there is an ongoing discussion to reduce the size of version numbers, but the problem will likely reappear elsewhere
+https://github.com/faster-cpython/ideas/issues/533
+** version tags for e.g. dictionary keys
+*** if the keys object structure has not changed, the quickened version can access a value via an index in an array
+
+* things I learned about Numpy
+
+** adding a debug version of numpy to the virtualenv
+The following command builds numpy (with meson somehow) and passes the `buildtype=debug` and `build-dir=build-dbg` parameters to meson.
+`no-build-isolation` means that the pip package uses the binaries/sources in the `build-db` directory or the numpy directory respectively.
+
+<#+begin_src bash
+pip install -v -e ../numpy --no-build-isolation --config-settings="setup-args=-Dbuildtype=debug" --config-settings="build-dir=build-dbg"
+#+end_src
+
+Also (I think) the following patch is neccessary in the `meson.build` file of Numpy
+<#+begin_src patch
+Subject: [PATCH] patch
+---
+Index: meson.build
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>ISO-8859-1
+===================================================================
+diff --git a/meson.build b/meson.build
+--- a/meson.build	(revision b0371ef240560e78b651a5d7c9407ae3212a3d56)
++++ b/meson.build	(date 1705913997667)
+@@ -37,8 +37,13 @@
+   error('NumPy requires Cython >= 3.0.6')
+ endif
+
+-py = import('python').find_installation(pure: false)
++py = import('python').find_installation('/home/felixl/repositories/cpython/python', pure: false)
+ py_dep = py.dependency()
++#
++#
++#py_inc = include_directories('/home/felixl/repositories/cpython/Include')
++#py_dep = declare_dependency(include_directories : py_inc)
++
+
+ if not cc.has_header('Python.h', dependencies: py_dep)
+   error('Cannot compile `Python.h`. Perhaps you need to install python-dev|python-devel')
+#+end_src
+
+** calling Numpy C functions directly
+*** depends on what kind of C function should be called
+*** if the function is a Python function defined in Numpy (either with `def` or `cdef`), Numpy creates a wrapper with Cython
+**** without modification, the wrapper would be called with the [[https://peps.python.org/pep-0590/][vector call protocol]]
+**** since we know that the target callable supports the vector call protocol, we can skip all steps of the ceremony but the last
+***** packaging the call and its context (e.g. self) into a vectorcall object
+***** calling the Cython wrapper
+***** unpacking the vectorcall object and shifting the args pointer
+***** call the actual callee
+**** TODO not sure yet how to properly expose the callee, I just forward declared it in Python
+***** Cython does not allow `cdef api` for functions with optional (i.e. `param=None`) parameters for some reason
+*** if the function is a C function
+**** mark it as an API function with a comment containing `NUMPY_API`
+**** register a slot number in `numpy_api.py`
+**** the Numpy build will then include it in the corresponding __XXX_api.h file (e.g. `__multiarray_api.h`)
+***** the file does not expose the function itself, but adds it to an array and makes it accessible via a macro
+***** TODO not sure if that causes a performance penalty because the array is local and the compiler should be able to constant fold it
+**** need to call `import_array` to initialize the Numpy array of API pointers somewhere
+***** NOTE must not happen in bootstrap Python because it simulates Pythons import and breaks bootstrapping
+***** TODO currently part of the super instruction, should instead happen in Python/in the future extension
+***** TODO `NPY_FEATURE_VERSION` is not set properly, causing the API header to not define the accessor macro. For now I patched it manually
+*** NOTE the fact that Numpy uses Cython might help us in the future
+**** maybe we can implement the envisioned automatic generation of a CMLQ extension with Cython
+
+** numpy ufuncs
+*** differentiate between inner func and outer func
+**** inner funcs operate element wise, e.g., pairwise add the elements of two arrays
+**** outer funcs operate on the structure of arrays, e.g., matrix multiplication
+**** when applying an inner func, the ufunc efficiently loops over the array(s)
+**** not sure yet how it works for outer funcs
+**** outer ufuncs
+***** have special argument preparation
+****** for legacy reasons, check if arguments are matrixes
+****** the resulting number of dimensions are dims(a) + dims(b)
+****** each result dimension is 1
+******
+*** represented as Python objects as well
+**** contains multiple `PyArrayMethodObject`s that know how to loop over different array types and apply different operations
+**** implementations are mostly autogenerated with code in `__umath_generated.c.src`
+**** also exploits hardware features such as SSE or AVX if available
+** value promotion
+*** when operating on arrays of different datatypes, Numpy has to find a common datatype to perform the operation and represent the result
+*** the old system, ~value-based promotion~, uses a set of predefined rules and a predefined datatype hierarchy
+**** more importantly, the actual values (as opposed to their types) of an operand can decide the promotion (see https://numpy.org/neps/nep-0050-scalar-promotion.html)
+<#+begin_src Python
+np.result_type(np.int8, 1) == np.int8
+np.result_type(np.int8, 255) == np.int16
+
+int64_0d_array = np.array(1, dtype=np.int64)
+np.result_type(np.int8, int64_0d_array) == np.int8  # note how the dtype is ignored and the arrays value is considered instead
+#+end_src
+*** the new scheme never considers the values and consideres Python datatypes to be "weakly" typed, requiring promotion to a Numpy type in an operation
+- the environment variable `NPY_PROMOTION_STATE` configures the promotion behaviour
+
+* implementation notes external specialization
+** could use a custom optimizer/executor pair
+*** optimizer rewrites instructions to a regular instruction format
+*** executor uses a custom dispatch loop that
+**** whenever a frame is entered, sets some thread local storage of the the involved extensions to pointers to e.g. the instruction pointer
+**** allows bytecode handlers to reside fully in the extension code and use the TLS pointers to alter the instruction pointer / stack pointer
+** alternative solution
+*** keep using the `EXTERNAL` bytecode and encode the necessary information (e.g. size of the inline cache to skip) either in the oparg or somewhere in the frame
+*** could also allocate some cache in for each external instruction in the frame
